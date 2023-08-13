@@ -1,4 +1,5 @@
-use crate::Options;
+use crate::{Options};
+use crate::resolver::{RESOLVER, ResolverError};
 use std::{
     borrow::Borrow,
     net::{IpAddr},
@@ -9,7 +10,6 @@ use std::{
     },
 };
 use tracing::*;
-use trust_dns_resolver::TokioAsyncResolver;
 
 use trust_dns_server::{
     authority::MessageResponseBuilder,
@@ -28,6 +28,8 @@ pub enum Error {
     InvalidZone(LowerName),
     #[error("IO error: {0:}")]
     Io(#[from] std::io::Error),
+    #[error("Resolver error: {0:}")]
+    Resolver(#[from] ResolverError),
 }
 
 // DNS Request Handler
@@ -113,7 +115,8 @@ impl Handler {
         request: &Request,
         mut responder: R,
     ) -> Result<ResponseInfo, Error> {
-        let resolver = TokioAsyncResolver::tokio_from_system_conf().map_err(|e| Error::Io(e.into()))?;
+        let resolver = RESOLVER.as_ref().map_err(|e| Error::Resolver(e.clone()))?;
+
         let name: Name = request.query().name().into();
         let lookup = resolver.lookup_ip(name).await.map_err(|_| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "Failed to resolve")))?;
         
@@ -131,6 +134,7 @@ impl Handler {
         let response = builder.build(header, records.iter(), &[], &[], &[]);
         Ok(responder.send_response(response).await?)
     }
+    
 
     async fn do_handle_request_entry<R: ResponseHandler>(
         &self,

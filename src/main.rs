@@ -8,6 +8,7 @@ use trust_dns_server::ServerFuture;
 
 mod options;
 mod handler;
+mod resolver;
 
 /// Timeout for TCP connections
 const TCP_TIMEOUT: Duration = Duration::from_secs(5);

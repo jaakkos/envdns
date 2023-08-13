@@ -221,6 +221,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "once_cell",
  "thiserror",
  "tokio",
  "tracing",
