@@ -1,19 +1,12 @@
-use crate::{Options};
-use crate::resolver::{RESOLVER, ResolverError};
-use std::{
-    borrow::Borrow,
-    net::{IpAddr},
-    str::FromStr,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-};
+use crate::resolver::{resolve, ResolverError};
+use crate::Options;
+use std::net::IpAddr;
+use std::{borrow::Borrow, str::FromStr, sync::Arc};
 use tracing::*;
 
 use trust_dns_server::{
     authority::MessageResponseBuilder,
-    client::rr::{rdata::TXT, LowerName, Name, RData, Record},
+    client::rr::{LowerName, Name, RData, Record},
     proto::op::{Header, MessageType, OpCode, ResponseCode},
     server::{Request, RequestHandler, ResponseHandler, ResponseInfo},
 };
@@ -24,8 +17,6 @@ pub enum Error {
     InvalidOpCode(OpCode),
     #[error("Invalid MessageType {0:}")]
     InvalidMessageType(MessageType),
-    #[error("Invalid Zone {0:}")]
-    InvalidZone(LowerName),
     #[error("IO error: {0:}")]
     Io(#[from] std::io::Error),
     #[error("Resolver error: {0:}")]
@@ -56,16 +47,18 @@ impl Handler {
             counter_zone: LowerName::from(Name::from_str(&format!("counter.{domain}")).unwrap()),
             myip_zone: LowerName::from(Name::from_str(&format!("myip.{domain}")).unwrap()),
             hello_zone: LowerName::from(Name::from_str(&format!("hello.{domain}")).unwrap()),
-            entries: Arc::new(options
-                .entries
-                .iter()
-                .map(|entry| {
-                    let parts: Vec<&str> = entry.split(':').collect();
-                    let name = LowerName::from_str(parts[0]).unwrap();
-                    let ip = IpAddr::from_str(parts[1]).unwrap();
-                    (name, ip)
-                })
-                .collect())
+            entries: Arc::new(
+                options
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        let parts: Vec<&str> = entry.split(':').collect();
+                        let name = LowerName::from_str(parts[0]).unwrap();
+                        let ip = IpAddr::from_str(parts[1]).unwrap();
+                        (name, ip)
+                    })
+                    .collect(),
+            ),
         }
     }
 
@@ -75,7 +68,9 @@ impl Handler {
         let name_string = query_name.to_string();
 
         info!("Query name: {:#?}", name_string);
-        self.entries.iter().any(|(entry_name, _)| entry_name == query_name)
+        self.entries
+            .iter()
+            .any(|(entry_name, _)| entry_name == query_name)
     }
 
     // Handle requests for myip.{domain}.
@@ -115,26 +110,21 @@ impl Handler {
         request: &Request,
         mut responder: R,
     ) -> Result<ResponseInfo, Error> {
-        let resolver = RESOLVER.as_ref().map_err(|e| Error::Resolver(e.clone()))?;
-
         let name: Name = request.query().name().into();
-        let lookup = resolver.lookup_ip(name).await.map_err(|_| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "Failed to resolve")))?;
-        
-        let builder = MessageResponseBuilder::from_message_request(request);
-        let mut header = Header::response_from_request(request.header());
-        header.set_authoritative(false); // since we're just proxying
-        let records: Vec<Record> = lookup
-            .iter()
-            .map(|ip| Record::from_rdata(request.query().name().into(), 60, match ip {
-                IpAddr::V4(ipv4) => RData::A(ipv4),
-                IpAddr::V6(ipv6) => RData::AAAA(ipv6),
-            }))
-            .collect();
-        
-        let response = builder.build(header, records.iter(), &[], &[], &[]);
-        Ok(responder.send_response(response).await?)
+
+        // Use the resolve function
+        match resolve(name.clone()).await {
+            Ok(records) => {
+                let builder = MessageResponseBuilder::from_message_request(request);
+                let mut header = Header::response_from_request(request.header());
+                header.set_authoritative(false); // since we're just proxying
+
+                let response = builder.build(header, records.iter(), &[], &[], &[]);
+                Ok(responder.send_response(response).await?)
+            }
+            Err(e) => Err(Error::Resolver(e)), // Handle the error accordingly. Here I'm converting the ResolverError into your custom Error type.
+        }
     }
-    
 
     async fn do_handle_request_entry<R: ResponseHandler>(
         &self,
@@ -144,22 +134,26 @@ impl Handler {
         let name: &Name = request.query().name().borrow();
         // convert Name to LowerName
         let name_lower: LowerName = name.into();
-        
+
         // Since we're sure the entry exists, we can just unwrap it
-        let entry = self.entries.iter().find(|(entry_name, _)| entry_name == &name_lower).unwrap();
-        
+        let entry = self
+            .entries
+            .iter()
+            .find(|(entry_name, _)| entry_name == &name_lower)
+            .unwrap();
+
         let builder = MessageResponseBuilder::from_message_request(request);
         let mut header = Header::response_from_request(request.header());
         header.set_authoritative(true);
-        
+
         let rdata = match entry.1 {
             IpAddr::V4(ipv4) => RData::A(ipv4),
             IpAddr::V6(ipv6) => RData::AAAA(ipv6),
         };
-        
+
         let records = vec![Record::from_rdata(request.query().name().into(), 60, rdata)];
         let response = builder.build(header, records.iter(), &[], &[], &[]);
-        
+
         Ok(responder.send_response(response).await?)
     }
 

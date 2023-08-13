@@ -26,7 +26,7 @@ impl From<ResolveError> for ResolverError {  // Conversion from ResolveError to 
 }
 
 // Singleton for TokioAsyncResolver
-pub static RESOLVER: Lazy<Result<TokioAsyncResolver, ResolverError>> = Lazy::new(|| {
+static RESOLVER: Lazy<Result<TokioAsyncResolver, ResolverError>> = Lazy::new(|| {
     TokioAsyncResolver::tokio_from_system_conf().map_err(ResolverError::from)
 });
 
