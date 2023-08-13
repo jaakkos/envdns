@@ -1,7 +1,7 @@
 use crate::Options;
 use std::{
     borrow::Borrow,
-    net::IpAddr,
+    net::{IpAddr},
     str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -30,41 +30,58 @@ pub enum Error {
     Io(#[from] std::io::Error),
 }
 
-/// DNS Request Handler
+// DNS Request Handler
 #[derive(Clone, Debug)]
 pub struct Handler {
-    /// Request counter, incremented on every successful request.
-    pub counter: Arc<AtomicU64>,
-    /// Domain to serve DNS responses for (requests for other domains are silently ignored).
+    // Domain to serve DNS responses for (requests for other domains are silently ignored).
     pub root_zone: LowerName,
-    /// Zone name for counter (counter.envdens.local)
+    // Zone name for counter (counter.envdens.local)
     pub counter_zone: LowerName,
-    /// Zone name for myip (myip.envdens.local)
+    // Zone name for myip (myip.envdens.local)
     pub myip_zone: LowerName,
-    /// Zone name for hello (hello.envdens.local)
+    // Zone name for hello (hello.envdens.local)
     pub hello_zone: LowerName,
+    // Entries to resolve locally
+    pub entries: Arc<Vec<(LowerName, IpAddr)>>,
 }
 
 impl Handler {
-    /// Create new handler from command-line options.
+    // Create new handler from command-line options.
     pub fn from_options(options: &Options) -> Self {
         let domain = &options.domain;
         Handler {
             root_zone: LowerName::from(Name::from_str(domain).unwrap()),
-            counter: Arc::new(AtomicU64::new(0)),
             counter_zone: LowerName::from(Name::from_str(&format!("counter.{domain}")).unwrap()),
             myip_zone: LowerName::from(Name::from_str(&format!("myip.{domain}")).unwrap()),
             hello_zone: LowerName::from(Name::from_str(&format!("hello.{domain}")).unwrap()),
+            entries: Arc::new(options
+                .entries
+                .iter()
+                .map(|entry| {
+                    let parts: Vec<&str> = entry.split(':').collect();
+                    let name = LowerName::from_str(parts[0]).unwrap();
+                    let ip = IpAddr::from_str(parts[1]).unwrap();
+                    (name, ip)
+                })
+                .collect())
         }
     }
 
-    /// Handle requests for myip.{domain}.
+    /// Checks if a given query name is in the entries
+    fn is_query_in_entries(&self, query_name: &LowerName) -> bool {
+        // Extracting the string representation from the LowerName
+        let name_string = query_name.to_string();
+
+        info!("Query name: {:#?}", name_string);
+        self.entries.iter().any(|(entry_name, _)| entry_name == query_name)
+    }
+
+    // Handle requests for myip.{domain}.
     async fn do_handle_request_myip<R: ResponseHandler>(
         &self,
         request: &Request,
         mut responder: R,
     ) -> Result<ResponseInfo, Error> {
-        self.counter.fetch_add(1, Ordering::SeqCst);
         let builder = MessageResponseBuilder::from_message_request(request);
         let mut header = Header::response_from_request(request.header());
         header.set_authoritative(true);
@@ -77,54 +94,12 @@ impl Handler {
         Ok(responder.send_response(response).await?)
     }
 
-    /// Handle requests for counter.{domain}.
-    async fn do_handle_request_counter<R: ResponseHandler>(
-        &self,
-        request: &Request,
-        mut responder: R,
-    ) -> Result<ResponseInfo, Error> {
-        let counter = self.counter.fetch_add(1, Ordering::SeqCst);
-        let builder = MessageResponseBuilder::from_message_request(request);
-        let mut header = Header::response_from_request(request.header());
-        header.set_authoritative(true);
-        let rdata = RData::TXT(TXT::new(vec![counter.to_string()]));
-        let records = vec![Record::from_rdata(request.query().name().into(), 60, rdata)];
-        let response = builder.build(header, records.iter(), &[], &[], &[]);
-        Ok(responder.send_response(response).await?)
-    }
-
-    /// Handle requests for *.hello.{domain}.
-    async fn do_handle_request_hello<R: ResponseHandler>(
-        &self,
-        request: &Request,
-        mut responder: R,
-    ) -> Result<ResponseInfo, Error> {
-        self.counter.fetch_add(1, Ordering::SeqCst);
-        let builder = MessageResponseBuilder::from_message_request(request);
-        let mut header = Header::response_from_request(request.header());
-        header.set_authoritative(true);
-        let name: &Name = request.query().name().borrow();
-        let zone_parts = (name.num_labels() - self.hello_zone.num_labels() - 1) as usize;
-        let name = name
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| i <= &zone_parts)
-            .fold(String::from("hello,"), |a, (_, b)| {
-                a + " " + &String::from_utf8_lossy(b)
-            });
-        let rdata = RData::TXT(TXT::new(vec![name]));
-        let records = vec![Record::from_rdata(request.query().name().into(), 60, rdata)];
-        let response = builder.build(header, records.iter(), &[], &[], &[]);
-        Ok(responder.send_response(response).await?)
-    }
-
-    /// Handle requests for anything else (NXDOMAIN)
+    // Handle requests for anything else (NXDOMAIN)
     async fn do_handle_request_default<R: ResponseHandler>(
         &self,
         request: &Request,
         mut responder: R,
     ) -> Result<ResponseInfo, Error> {
-        self.counter.fetch_add(1, Ordering::SeqCst);
         let builder = MessageResponseBuilder::from_message_request(request);
         let mut header = Header::response_from_request(request.header());
         header.set_authoritative(true);
@@ -157,7 +132,34 @@ impl Handler {
         Ok(responder.send_response(response).await?)
     }
 
-    /// Handle request, returning ResponseInfo if response was successfully sent, or an error.
+    async fn do_handle_request_entry<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        mut responder: R,
+    ) -> Result<ResponseInfo, Error> {
+        let name: &Name = request.query().name().borrow();
+        // convert Name to LowerName
+        let name_lower: LowerName = name.into();
+        
+        // Since we're sure the entry exists, we can just unwrap it
+        let entry = self.entries.iter().find(|(entry_name, _)| entry_name == &name_lower).unwrap();
+        
+        let builder = MessageResponseBuilder::from_message_request(request);
+        let mut header = Header::response_from_request(request.header());
+        header.set_authoritative(true);
+        
+        let rdata = match entry.1 {
+            IpAddr::V4(ipv4) => RData::A(ipv4),
+            IpAddr::V6(ipv6) => RData::AAAA(ipv6),
+        };
+        
+        let records = vec![Record::from_rdata(request.query().name().into(), 60, rdata)];
+        let response = builder.build(header, records.iter(), &[], &[], &[]);
+        
+        Ok(responder.send_response(response).await?)
+    }
+
+    // Handle request, returning ResponseInfo if response was successfully sent, or an error.
     async fn do_handle_request<R: ResponseHandler>(
         &self,
         request: &Request,
@@ -173,20 +175,20 @@ impl Handler {
             return Err(Error::InvalidMessageType(request.message_type()));
         }
 
+        // print entries
+        info!("Entries: {:#?}", self.entries);
+
         match request.query().name() {
+            name if self.is_query_in_entries(name) => {
+                self.do_handle_request_entry(request, response).await
+            }
             name if self.myip_zone.zone_of(name) => {
                 self.do_handle_request_myip(request, response).await
-            }
-            name if self.counter_zone.zone_of(name) => {
-                self.do_handle_request_counter(request, response).await
-            }
-            name if self.hello_zone.zone_of(name) => {
-                self.do_handle_request_hello(request, response).await
             }
             name if self.root_zone.zone_of(name) => {
                 self.do_handle_request_default(request, response).await
             }
-            name => self.do_handle_request_other(request, response).await,
+            _name => self.do_handle_request_other(request, response).await,
         }
     }
 }

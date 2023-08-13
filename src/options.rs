@@ -15,7 +15,14 @@ pub struct Options {
     #[clap(long, short, default_value = "evndns.local", env = "EVNDNS_DOMAIN")]
     pub domain: String,
 
-    // Upstream DNS server
-    #[clap(long, short, default_value = "8.8.8.8", env = "EVNDNS_UPSTREAM")]
-    pub upstream: SocketAddr,
+    // Global DNS entries
+    #[clap(long, short, default_value = "foobar:127.0.0.1", env = "EVNDNS_GLOBAL_ENTRIES")]
+    pub entries: Vec<String>,
+}
+
+#[derive(Debug, Clone, Parser)]
+pub struct ClientOptions {
+    // DNS entry list
+    #[clap(long, short, default_value = "foobar:127.0.0.1", env = "EVNDNS_ENTRIES")]
+    pub entries: Vec<String>,
 }
